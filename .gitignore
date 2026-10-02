@@ -4,3 +4,7 @@ vinted.db
 /__pycache__
 /logs/vinted.log
 /vinted_notifications.db
+# Runtime state: sqlite db holds the Telegram token + chat id,
+# logs hold the server IP. Never commit these.
+/data/
+/logs/
