@@ -1,4 +1,5 @@
 import db
+import html
 import requests
 from pyVintedVN import Vinted, requester
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -252,30 +253,55 @@ def get_user_country(profile_id):
     Makes an API request to retrieve the user's country code.
     Handles rate limiting by trying an alternative endpoint.
 
+    Any failure (401/403/404/500, bad JSON, missing keys, network error)
+    returns "XX" instead of raising, so a single lookup can never kill the
+    item-extractor process. "XX" is always treated as allowed.
+
     Args:
         profile_id (str): The Vinted user's profile ID
 
     Returns:
         str: The user's country code (2-letter ISO code) or "XX" if it can't be determined
     """
-    # Users are shared between all Vinted platforms, so we can use whatever locale we want
-    url = f"https://www.vinted.fr/api/v2/users/{profile_id}?localize=false"
-    response = requester.get(url)
-    # That's a LOT of requests, so if we get a 429 we wait a bit before retrying once
-    if response.status_code == 429:
-        # In case of rate limit, we're switching the endpoint. This one is slower, but it doesn't RL as soon.
-        # We're limiting the items per page to 1 to grab as little data as possible
-        url = f"https://www.vinted.fr/api/v2/users/{profile_id}/items?page=1&per_page=1"
+    try:
+        # Users are shared between all Vinted platforms, so we can use whatever locale we want
+        url = f"https://www.vinted.fr/api/v2/users/{profile_id}?localize=false"
         response = requester.get(url)
-        try:
-            user_country = response.json()["items"][0]["user"]["country_iso_code"]
-        except KeyError:
+        # That's a LOT of requests, so if we get a 429 we wait a bit before retrying once
+        if response.status_code == 429:
+            # In case of rate limit, we're switching the endpoint. This one is slower, but it doesn't RL as soon.
+            # We're limiting the items per page to 1 to grab as little data as possible
+            url = f"https://www.vinted.fr/api/v2/users/{profile_id}/items?page=1&per_page=1"
+            response = requester.get(url)
+            try:
+                user_country = response.json()["items"][0]["user"][
+                    "country_iso_code"
+                ]
+            except (KeyError, IndexError, TypeError, ValueError):
+                logger.warning(
+                    "Couldn't get the country due to too many requests. Returning default value."
+                )
+                user_country = "XX"
+        elif response.status_code != 200:
             logger.warning(
-                "Couldn't get the country due to too many requests. Returning default value."
+                f"Couldn't get country for user {profile_id}: "
+                f"HTTP {response.status_code}. Returning default value."
             )
             user_country = "XX"
-    else:
-        user_country = response.json()["user"]["country_iso_code"]
+        else:
+            try:
+                user_country = response.json()["user"]["country_iso_code"]
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    f"Couldn't parse country for user {profile_id}. Returning default value."
+                )
+                user_country = "XX"
+    except Exception:
+        logger.warning(
+            f"Couldn't get country for user {profile_id} due to an error. Returning default value.",
+            exc_info=True,
+        )
+        user_country = "XX"
     return user_country
 
 
@@ -299,22 +325,50 @@ def process_items(queue):
     # Get the number of items per query from the database
     items_per_query = int(db.get_parameter("items_per_query"))
 
-    # for each keyword we parse data
+    # for each keyword we parse data. One failing query must never skip the
+    # remaining queries, so each query is isolated with its own try/except.
     for query in all_queries:
-        all_items = vinted.items.search(query[1], nbr_items=items_per_query)
-        # Filter to only include new items. This should reduce the amount of db calls.
-        data = [item for item in all_items if item.is_new_item()]
+        try:
+            all_items = vinted.items.search(query[1], nbr_items=items_per_query)
+        except Exception:
+            logger.error(
+                f"Failed to scrape query {query[0]}: {query[1]}",
+                exc_info=True,
+            )
+            continue
+        try:
+            # Filter to only include new items. This should reduce the amount of db calls.
+            data = [item for item in all_items if item.is_new_item()]
+        except Exception:
+            logger.error(
+                f"Failed to filter items for query {query[0]}",
+                exc_info=True,
+            )
+            continue
         queue.put((data, query[0]))
-        logger.info(f"Scraped {len(data)} items for query: {query[1]}")
+        logger.info(
+            f"Scraped {len(data)} new of {len(all_items)} total for query: {query[1]}"
+        )
 
 
 def clear_item_queue(items_queue, new_items_queue):
     """
     Process items from the items_queue.
     This function is scheduled to run frequently.
+
+    It never raises: one bad batch or one bad item is logged and skipped so
+    the extractor process stays alive. (An uncaught exception here used to kill
+    the extractor while the scraper kept logging "Scraped 20 items".)
     """
-    if not items_queue.empty():
+    try:
+        if items_queue.empty():
+            return
         data, query_id = items_queue.get()
+    except Exception:
+        logger.error("Failed to read from items_queue", exc_info=True)
+        return
+
+    try:
         banwords_str = db.get_parameter("banwords")
 
         # Read the watermark once, before the loop. It doubles as the "has this query
@@ -328,49 +382,74 @@ def clear_item_queue(items_queue, new_items_queue):
                 f"without notifying, so the existing catalogue is not replayed."
             )
 
+        allowlist = db.get_allowlist()
         to_notify = []
         for item in reversed(data):
+            try:
+                # The watermark is only meaningful when the API actually supplied a
+                # listing time. Otherwise raw_timestamp is merely when we saw the item,
+                # and comparing it against the watermark would discard every new item.
+                if (
+                    item.has_real_timestamp
+                    and last_query_timestamp is not None
+                    and last_query_timestamp >= item.raw_timestamp
+                ):
+                    continue
+                # In case of multiple queries, we need to check if the item is already in the db
+                if db.is_item_in_db_by_id(item.id) is True:
+                    # We update the timestamp
+                    db.update_last_timestamp(query_id, item.raw_timestamp)
+                    continue
+                # If there's an allowlist and
+                # If the user's country is not in the allowlist, we just update the timestamp.
+                # A missing user block means "unknown" -> allowed (same as "XX").
+                if allowlist != 0:
+                    try:
+                        user_id = (item.raw_data.get("user") or {}).get("id")
+                    except Exception:
+                        user_id = None
+                    try:
+                        country = (
+                            get_user_country(user_id)
+                            if user_id is not None
+                            else "XX"
+                        )
+                    except Exception:
+                        # get_user_country should never raise, but if it ever
+                        # does, fail open (notify) rather than kill the batch.
+                        logger.warning(
+                            "Country lookup failed; treating as unknown (allowed)",
+                            exc_info=True,
+                        )
+                        country = "XX"
+                    if country not in (allowlist + ["XX"]):
+                        db.update_last_timestamp(query_id, item.raw_timestamp)
+                        continue
+                # Check if the item title contains any banwords
+                if banwords_str and contains_banwords(item.title, banwords_str):
+                    # If it contains banwords, just update the timestamp and skip
+                    db.update_last_timestamp(query_id, item.raw_timestamp)
+                    continue
 
-            # The watermark is only meaningful when the API actually supplied a
-            # listing time. Otherwise raw_timestamp is merely when we saw the item,
-            # and comparing it against the watermark would discard every new item.
-            if (
-                item.has_real_timestamp
-                and last_query_timestamp is not None
-                and last_query_timestamp >= item.raw_timestamp
-            ):
+                # Being recorded is what stops an item coming back next run, so every
+                # item that reaches this point is written to the db whether or not it
+                # ends up being announced.
+                to_notify.append(item)
+                db.add_item_to_db(
+                    id=item.id,
+                    timestamp=item.raw_timestamp,
+                    price=item.price,
+                    title=item.title,
+                    photo_url=item.photo,
+                    query_id=query_id,
+                    currency=item.currency,
+                )
+            except Exception:
+                logger.error(
+                    f"Skipping item {getattr(item, 'id', '?')} for query {query_id} due to an error",
+                    exc_info=True,
+                )
                 continue
-            # In case of multiple queries, we need to check if the item is already in the db
-            if db.is_item_in_db_by_id(item.id) is True:
-                # We update the timestamp
-                db.update_last_timestamp(query_id, item.raw_timestamp)
-                continue
-            # If there's an allowlist and
-            # If the user's country is not in the allowlist, we just update the timestamp
-            if db.get_allowlist() != 0 and (
-                get_user_country(item.raw_data["user"]["id"])
-            ) not in (db.get_allowlist() + ["XX"]):
-                db.update_last_timestamp(query_id, item.raw_timestamp)
-                continue
-            # Check if the item title contains any banwords
-            if banwords_str and contains_banwords(item.title, banwords_str):
-                # If it contains banwords, just update the timestamp and skip
-                db.update_last_timestamp(query_id, item.raw_timestamp)
-                continue
-
-            # Being recorded is what stops an item coming back next run, so every
-            # item that reaches this point is written to the db whether or not it
-            # ends up being announced.
-            to_notify.append(item)
-            db.add_item_to_db(
-                id=item.id,
-                timestamp=item.raw_timestamp,
-                price=item.price,
-                title=item.title,
-                photo_url=item.photo,
-                query_id=query_id,
-                currency=item.currency,
-            )
 
         if is_first_run:
             return
@@ -386,17 +465,33 @@ def clear_item_queue(items_queue, new_items_queue):
             to_notify = to_notify[-MAX_NOTIFICATIONS_PER_RUN:]
 
         for item in to_notify:
-            # We create the message
-            message_template = db.get_parameter("message_template")
-            content = message_template.format(
-                title=item.title,
-                price=str(item.price) + " " + item.currency,
-                brand=item.brand_title,
-                image=None if item.photo is None else item.photo,
-            )
-            # add the item to the queue
-            new_items_queue.put((content, item.url, "Open Vinted", None, None))
-            # new_items_queue.put((content, item.url, "Open Vinted", item.buy_url, "Open buy page"))
+            try:
+                # We create the message. Values are HTML-escaped because the
+                # message is sent with parse_mode="HTML" -- an unescaped "&",
+                # "<" or ">" in a title used to make Telegram reject the whole
+                # message.
+                message_template = db.get_parameter("message_template")
+                content = message_template.format(
+                    title=html.escape(str(item.title)),
+                    price=html.escape(str(item.price) + " " + item.currency),
+                    brand=html.escape(str(item.brand_title)),
+                    image=item.photo or item.url,
+                )
+                # add the item to the queue
+                new_items_queue.put((content, item.url, "Open Vinted", None, None))
+                # new_items_queue.put((content, item.url, "Open Vinted", item.buy_url, "Open buy page"))
+            except Exception:
+                logger.error(
+                    f"Failed to queue notification for item {getattr(item, 'id', '?')}",
+                    exc_info=True,
+                )
+                continue
+    except Exception:
+        logger.error(
+            "Failed to process an items batch; extractor stays alive",
+            exc_info=True,
+        )
+        return
 
 
 def contains_banwords(title, banwords_str):

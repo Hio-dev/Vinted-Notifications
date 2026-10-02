@@ -63,7 +63,14 @@ class Item:
 
         self.currency = data["price"]["currency_code"]
         self.price = data["price"]["amount"]
-        self.photo = (data.get("photo") or {}).get("url")
+        photo_block = data.get("photo") or {}
+        self.photo = (
+            photo_block.get("url")
+            or photo_block.get("full_size_url")
+            or ((photo_block.get("thumbnails") or [{}])[0].get("url"))
+            or ((data.get("photos") or [{}])[0].get("url"))
+            or ((data.get("photos") or [{}])[0].get("full_size_url"))
+        )
 
         # Item URLs are now relative (/items/123-slug), so rebuild the absolute one.
         url = data["url"]

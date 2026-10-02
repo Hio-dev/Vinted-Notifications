@@ -66,9 +66,16 @@ class Items:
             items = response.json()
             items = items["items"]
 
-            # Return either Item objects or raw JSON data
+            # Return either Item objects or raw JSON data. One malformed item
+            # must not discard the whole batch.
             if not json:
-                return [Item(_item, locale) for _item in items]
+                parsed = []
+                for _item in items:
+                    try:
+                        parsed.append(Item(_item, locale))
+                    except Exception:
+                        continue
+                return parsed
             else:
                 return items
 
